@@ -1,0 +1,22 @@
+# Entornos virtuales de Python y caché
+.venv/
+venv/
+__pycache__/
+
+# Archivos de datos pesados (Historiales de mercado, ticks, etc.)
+*.csv
+*.json
+*.dat
+
+# Modelos de Machine Learning (para cuando entrenes tu IA)
+*.pkl
+*.h5
+*.joblib
+*.pt
+
+# Archivos de configuración sensibles (credenciales del broker)
+.env
+config.ini
+
+# Logs generados por la comunicación de ZeroMQ o errores
+*.log
