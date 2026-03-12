@@ -1,0 +1,22 @@
+# Núcleo de Análisis y Matemáticas
+pandas
+numpy
+
+# Machine Learning & IA
+scikit-learn
+xgboost
+torch
+
+# API de Gemini
+google-generativeai
+
+# Base de datos y asincronía
+psycopg2-binary
+asyncpg
+SQLAlchemy
+
+# Gestión de Entorno
+python-dotenv
+
+# Conexión futura a MetaTrader (Vantage)
+MetaTrader5
