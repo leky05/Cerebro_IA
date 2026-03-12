@@ -1,0 +1,25 @@
+# Entornos virtuales y caché de Python
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Variables de entorno y secretos (¡CRÍTICO!)
+.env
+.env.local
+
+# Datos masivos (No subimos gigabytes de histórico a GitHub)
+data_ingestion/*.csv
+data_ingestion/*.parquet
+database/*.db
+
+# Archivos de logs
+*.log
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
