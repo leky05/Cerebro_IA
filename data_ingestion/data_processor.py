@@ -22,47 +22,36 @@ class DukascopyProcessor:
         self.processed_data_dir.mkdir(parents=True, exist_ok=True)
 
     def process_m1_csv(self, filename: str) -> Path:
-        """
-        Lee un CSV de velas M1 de Dukascopy, lo limpia, ajusta la zona horaria
-        y lo guarda en formato Parquet.
-        """
-        file_path = self.raw_data_dir / filename
-        
-        if not file_path.exists():
-            raise FileNotFoundError(f"❌ No se encontró el archivo: {file_path}")
-            
+
         print(f"🔄 Procesando {filename}...")
         
-        # 1. Lectura del CSV
-        # Dukascopy suele usar 'Local time' o 'Gmt time' como columna de tiempo
+        file_path = self.raw_data_dir / filename
         df = pd.read_csv(file_path)
         
-        # 2. Estandarización de columnas a minúsculas para coincidir con la Base de Datos
-        df.columns = [col.lower().replace(' ', '_') for col in df.columns]
-        
-        # Renombramos la columna de tiempo si es necesario para mantener estándar
-        if 'local_time' in df.columns:
-            df.rename(columns={'local_time': 'time'}, inplace=True)
-        elif 'gmt_time' in df.columns:
-            df.rename(columns={'gmt_time': 'time'}, inplace=True)
-
-        # 3. Tratamiento Temporal (Crítico)
-        # Convertimos el string a objeto datetime y forzamos la zona horaria UTC
-        df['time'] = pd.to_datetime(df['time'], format='mixed')
-        if df['time'].dt.tz is None:
-            df['time'] = df['time'].dt.tz_localize('UTC')
-        else:
-            df['time'] = df['time'].dt.tz_convert('UTC')
+        # 1. Estandarizar nombre de columna (Dukascopy usa 'timestamp')
+        if 'timestamp' in df.columns:
+            df.rename(columns={'timestamp': 'time'}, inplace=True)
             
-        # Ordenamos cronológicamente y eliminamos duplicados si los hay
-        df = df.sort_values('time').drop_duplicates(subset=['time'])
+        # 2. Agregar volumen en 0.0 si Dukascopy no lo incluyó (la Base de Datos lo exige)
+        if 'volume' not in df.columns:
+            df['volume'] = 0.0
+            
+        # 3. Convertir a formato de Tiempo (Soporta Milisegundos o Texto)
+        try:
+            # Intenta leerlo como milisegundos (formato masivo de Dukascopy)
+            df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True)
+        except ValueError:
+            # Si falla, intenta leerlo como texto normal (nuestro archivo de prueba)
+            df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
+            
+        # 4. Ordenar y establecer el índice
+        df = df[['time', 'open', 'high', 'low', 'close', 'volume']]
         df = df.set_index('time')
         
-        # 4. Guardado en formato Parquet
+        # 5. Guardado en formato Parquet
         output_filename = filename.replace('.csv', '.parquet')
         output_path = self.processed_data_dir / output_filename
         
-        # engine='pyarrow' requiere la librería pyarrow (la instalaremos luego si no la tienes)
         df.to_parquet(output_path, engine='pyarrow')
         
         print(f"✅ Archivo procesado y guardado en: {output_path}")
@@ -71,9 +60,11 @@ class DukascopyProcessor:
         return output_path
 
 if __name__ == "__main__":
-    # Este bloque solo se ejecuta si corres este script directamente
-    processor = DukascopyProcessor()
-    print("Módulo de procesamiento inicializado correctamente.")
+    processor = DukascopyProcessor()  # <-- ¡Aquí estaba el detalle!
+    print("Iniciando refinería del año 2024...")
     
-    # ¡Esta es la línea que hace la magia! Sin el '#' al principio.
-    processor.process_m1_csv("test_xauusd.csv")
+    # Llamamos al método correcto, pasándole solo el nombre del archivo
+    df_procesado = processor.process_m1_csv("xauusd_2024.csv")
+    
+    if df_procesado is not None:
+        print("¡Procesamiento de 2024 exitoso! Archivo .parquet generado.")

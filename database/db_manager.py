@@ -56,5 +56,6 @@ class DatabaseManager:
 
 if __name__ == "__main__":
     db = DatabaseManager()
-    # Ejecutamos la inyección de nuestro archivo de prueba de la Fase 3
-    db.insert_m1_data("data_ingestion/processed/test_xauusd.parquet")
+    
+    # Inyectamos el año 2024 completo al tanque
+    db.insert_m1_data("data_ingestion/processed/xauusd_2024.parquet")
