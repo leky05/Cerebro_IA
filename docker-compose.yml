@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: cerebro_db
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=admin_cerebro # Contraseña maestra local
+      - POSTGRES_DB=cerebro_data
+    ports:
+      - "5432:5432"
+    volumes:
+      # Volumen para que no pierdas los gigabytes de Dukascopy si apagas la PC
+      - cerebro_pg_data:/var/lib/postgresql/data
+      # Inyección automática de tu esquema SQL
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/1_schema.sql
+
+volumes:
+  cerebro_pg_data:
