@@ -60,11 +60,14 @@ class DukascopyProcessor:
         return output_path
 
 if __name__ == "__main__":
-    processor = DukascopyProcessor()  # <-- ¡Aquí estaba el detalle!
-    print("Iniciando refinería del año 2024...")
+    import os
+    processor = DukascopyProcessor()
+    print("Iniciando refinería masiva histórica...")
     
-    # Llamamos al método correcto, pasándole solo el nombre del archivo
-    df_procesado = processor.process_m1_csv("xauusd_2024.csv")
+    # Busca todos los CSV en raw, pero excluye el de 2024 que ya procesamos
+    archivos = [f for f in os.listdir(processor.raw_data_dir) if f.endswith('.csv') and '2024' not in f]
     
-    if df_procesado is not None:
-        print("¡Procesamiento de 2024 exitoso! Archivo .parquet generado.")
+    for archivo in archivos:
+        processor.process_m1_csv(archivo)
+        
+    print("¡Toda la historia antigua ha sido convertida a .parquet!")

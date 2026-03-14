@@ -55,7 +55,21 @@ class DatabaseManager:
             print(f"❌ Error crítico en la base de datos: {e}")
 
 if __name__ == "__main__":
-    db = DatabaseManager()
+    import os
+    from pathlib import Path
     
-    # Inyectamos el año 2024 completo al tanque
-    db.insert_m1_data("data_ingestion/processed/xauusd_2024.parquet")
+    db = DatabaseManager()
+    print("Iniciando inyección masiva al Tanque...")
+    
+    # Asegúrate de que esta ruta apunte a tu carpeta processed
+    carpeta_procesados = Path("data_ingestion/processed")
+    
+    # Busca todos los Parquet, excluyendo el de 2024
+    archivos = [f for f in os.listdir(carpeta_procesados) if f.endswith('.parquet') and '2024' not in f]
+    
+    for archivo in archivos:
+        ruta_completa = carpeta_procesados / archivo
+        print(f"Inyectando {archivo}...")
+        db.insert_m1_data(str(ruta_completa))
+        
+    print("✅ ¡7 Años de historia inyectados exitosamente en la Base de Datos!")
