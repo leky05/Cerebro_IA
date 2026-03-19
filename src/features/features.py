@@ -34,7 +34,8 @@ class SMCFeatureEngineer:
         df_feat['upper_wick_pct'] = df_feat['upper_wick'] / (df_feat['total_range'] + 1e-9)
         
         # 3. VOLUMEN RELATIVO (Confirmación Institucional)
-        df_feat['vol_sma_10'] = df_feat['volume'].rolling(window=10).mean()
+        # Ya corregido el leakage con el shift(1)
+        df_feat['vol_sma_10'] = df_feat['volume'].shift(1).rolling(window=10).mean()
         # Ratio: > 1.5 significa que hay un 50% más volumen que la media reciente
         df_feat['vol_relative'] = df_feat['volume'] / (df_feat['vol_sma_10'] + 1e-9)
         
@@ -63,9 +64,31 @@ class SMCFeatureEngineer:
             (df_feat['low'].shift(2) < df_feat['low']), 1, 0
         )
         df_feat['pl_low_price'] = np.where(df_feat['is_swing_low'] == 1, df_feat['low'].shift(2), np.nan)
+
+        # Extendemos el precio del último PL conocido hacia adelante para poder compararlo
+        df_feat['last_pl_high'] = df_feat['pl_high_price'].ffill()
+        df_feat['last_pl_low'] = df_feat['pl_low_price'].ffill()
+
+        # 6. TOMA DE LIQUIDEZ (Sweeps)
+        # Sweep Alcista: El precio baja más que el último Swing Low pero cierra por encima
+        df_feat['sweep_bullish'] = np.where(
+            (df_feat['low'] < df_feat['last_pl_low']) & (df_feat['close'] > df_feat['last_pl_low']), 1, 0
+        )
+        
+        # Sweep Bajista: El precio sube más que el último Swing High pero cierra por debajo
+        df_feat['sweep_bearish'] = np.where(
+            (df_feat['high'] > df_feat['last_pl_high']) & (df_feat['close'] < df_feat['last_pl_high']), 1, 0
+        )
+
+        # 7. MEMORIA DEL SABUESO (Filtro numérico para el LLM - Punto 12 de Claude)
+        # Marcamos si hubo un sweep en las últimas 36 velas (Aprox 3 horas en M5)
+        max_velas_sweep = 36
+        df_feat['recent_sweep_bullish'] = df_feat['sweep_bullish'].rolling(window=max_velas_sweep, min_periods=1).max()
+        df_feat['recent_sweep_bearish'] = df_feat['sweep_bearish'].rolling(window=max_velas_sweep, min_periods=1).max()
         
         # Limpieza de columnas temporales de cálculo
-        df_feat.drop(columns=['hour_utc', 'vol_sma_10'], inplace=True)
+        columnas_a_borrar = ['hour_utc', 'vol_sma_10', 'last_pl_high', 'last_pl_low']
+        df_feat.drop(columns=[col for col in columnas_a_borrar if col in df_feat.columns], inplace=True)
         df_feat.dropna(subset=['vol_relative'], inplace=True)
         
         print(f"✅ Ojos SMC listos. Velas procesadas: {len(df_feat)}")

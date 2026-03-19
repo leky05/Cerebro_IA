@@ -47,3 +47,8 @@ database/*.db
 # Archivos de sistema operativo
 .DS_Store
 Thumbs.db
+
+# Archivos de api gemini
+.env
+__pycache__/
+temp_chart.png
