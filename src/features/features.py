@@ -1,115 +1,181 @@
 import pandas as pd
 import numpy as np
 
+
 class SMCFeatureEngineer:
     """
-    Motor de Características enfocado en Smart Money Concepts (SMC).
-    Traduce el precio crudo a conceptos de Liquidez, FVG, Estructura y Tiempo.
+    Motor de Características Institucional v2.2 — Cerebro_IA
+    =========================================================
+    Responsabilidad ÚNICA: calcular features matemáticas puras
+    a partir del precio crudo. No toma decisiones de estado.
+
+    Features generadas:
+      - Filtro de sesiones (NY / London / Asia)
+      - Microestructura de vela (mechas, cuerpo, volumen relativo)
+      - Fair Value Gaps (FVG)
+      - Puntos Líquidos: en qué vela se CONFIRMA un Swing High/Low
+        y a qué precio exacto ocurrió.
+
+    IMPORTANTE — Separación de responsabilidades:
+      features.py  →  DETECTA swings y FVGs (matemática pura).
+      smc.py       →  PERSISTE zonas en memoria espacial,
+                       detecta sweeps en tiempo real, y evalúa
+                       confluencia para disparar señales.
     """
-    
+
+    # ── Parámetros Configurables ──────────────────────────────────
+    SWING_LOOKBACK = 10        # Velas a cada lado para confirmar un swing
+    VOL_SMA_PERIOD = 10        # Período de la SMA de volumen
+
+    # ──────────────────────────────────────────────────────────────
+    #  MÉTODO PRINCIPAL
+    # ──────────────────────────────────────────────────────────────
     @staticmethod
     def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
-        print("👁️ Activando visión institucional SMC...")
+        print("👁️ Activando visión institucional SMC v2.2 (Features puras)...")
         df_feat = df.copy()
-        
-        # 1. EL RELOJ (Filtro de Sesiones - Usando UTC como base)
-        # Asumimos que la data cruda está en UTC. 
-        # NY (10 a 13h Arg) equivale aprox a 13:00-16:00 UTC
-        # Londres equivale aprox a 07:00-10:00 UTC
-        # Asia equivale aprox a 00:00-03:00 UTC
-        df_feat['hour_utc'] = df_feat.index.hour
-        df_feat['is_ny_session'] = np.where((df_feat['hour_utc'] >= 13) & (df_feat['hour_utc'] < 16), 1, 0)
-        df_feat['is_london_session'] = np.where((df_feat['hour_utc'] >= 7) & (df_feat['hour_utc'] < 10), 1, 0)
-        df_feat['is_asian_session'] = np.where((df_feat['hour_utc'] >= 0) & (df_feat['hour_utc'] < 3), 1, 0)
-        
-        # 2. MICROESTRUCTURA DE LA VELA (Gatillos de Rechazo e Inyección)
-        df_feat['body_size'] = abs(df_feat['close'] - df_feat['open'])
-        df_feat['total_range'] = df_feat['high'] - df_feat['low']
-        df_feat['upper_wick'] = df_feat['high'] - df_feat[['open', 'close']].max(axis=1)
-        df_feat['lower_wick'] = df_feat[['open', 'close']].min(axis=1) - df_feat['low']
-        
-        # Porcentaje de mechas (Define qué tan fuerte es el "Martillo")
-        # Sumamos 1e-9 para evitar errores de división por cero en velas planas
-        df_feat['lower_wick_pct'] = df_feat['lower_wick'] / (df_feat['total_range'] + 1e-9)
-        df_feat['upper_wick_pct'] = df_feat['upper_wick'] / (df_feat['total_range'] + 1e-9)
-        
-        # 3. VOLUMEN RELATIVO (Confirmación Institucional)
-        # Ya corregido el leakage con el shift(1)
-        df_feat['vol_sma_10'] = df_feat['volume'].shift(1).rolling(window=10).mean()
-        # Ratio: > 1.5 significa que hay un 50% más volumen que la media reciente
-        df_feat['vol_relative'] = df_feat['volume'] / (df_feat['vol_sma_10'] + 1e-9)
-        
-        # 4. INEFICIENCIAS (Fair Value Gaps - FVG)
-        # FVG Alcista: El Low actual es mayor al High de hace 2 velas
-        df_feat['fvg_bullish'] = np.where(df_feat['low'] > df_feat['high'].shift(2), 1, 0)
-        
-        # FVG Bajista: El High actual es menor al Low de hace 2 velas
-        df_feat['fvg_bearish'] = np.where(df_feat['high'] < df_feat['low'].shift(2), 1, 0)
-        
-        # 5. PUNTOS LÍQUIDOS - PL (Swing Highs / Lows sin repintado)
-        # Un pico se confirma matemáticamente 2 velas DESPUÉS para evitar mirar al futuro
-        df_feat['is_swing_high'] = np.where(
-            (df_feat['high'].shift(2) > df_feat['high'].shift(1)) & 
-            (df_feat['high'].shift(2) > df_feat['high'].shift(3)) & 
-            (df_feat['high'].shift(2) > df_feat['high'].shift(4)) & 
-            (df_feat['high'].shift(2) > df_feat['high']), 1, 0
-        )
-        # Registramos el precio exacto de ese Punto Líquido
-        df_feat['pl_high_price'] = np.where(df_feat['is_swing_high'] == 1, df_feat['high'].shift(2), np.nan)
-        
-        df_feat['is_swing_low'] = np.where(
-            (df_feat['low'].shift(2) < df_feat['low'].shift(1)) & 
-            (df_feat['low'].shift(2) < df_feat['low'].shift(3)) & 
-            (df_feat['low'].shift(2) < df_feat['low'].shift(4)) & 
-            (df_feat['low'].shift(2) < df_feat['low']), 1, 0
-        )
-        df_feat['pl_low_price'] = np.where(df_feat['is_swing_low'] == 1, df_feat['low'].shift(2), np.nan)
 
-        # Extendemos el precio del último PL conocido hacia adelante para poder compararlo
-        df_feat['last_pl_high'] = df_feat['pl_high_price'].ffill()
-        df_feat['last_pl_low'] = df_feat['pl_low_price'].ffill()
-
-        # 6. TOMA DE LIQUIDEZ (Sweeps)
-        # Sweep Alcista: El precio baja más que el último Swing Low pero cierra por encima
-        df_feat['sweep_bullish'] = np.where(
-            (df_feat['low'] < df_feat['last_pl_low']) & (df_feat['close'] > df_feat['last_pl_low']), 1, 0
+        # ==========================================================
+        # 1. EL RELOJ — Filtro de Sesiones (UTC)
+        # ==========================================================
+        hour_utc = df_feat.index.hour
+        df_feat['is_ny_session'] = np.where(
+            (hour_utc >= 13) & (hour_utc < 16), 1, 0
         )
-        
-        # Sweep Bajista: El precio sube más que el último Swing High pero cierra por debajo
-        df_feat['sweep_bearish'] = np.where(
-            (df_feat['high'] > df_feat['last_pl_high']) & (df_feat['close'] < df_feat['last_pl_high']), 1, 0
+        df_feat['is_london_session'] = np.where(
+            (hour_utc >= 7) & (hour_utc < 10), 1, 0
+        )
+        df_feat['is_asian_session'] = np.where(
+            (hour_utc >= 0) & (hour_utc < 3), 1, 0
         )
 
-        # 7. MEMORIA DEL SABUESO (Filtro numérico para el LLM - Punto 12 de Claude)
-        # Marcamos si hubo un sweep en las últimas 36 velas (Aprox 3 horas en M5)
-        max_velas_sweep = 36
-        df_feat['recent_sweep_bullish'] = df_feat['sweep_bullish'].rolling(window=max_velas_sweep, min_periods=1).max()
-        df_feat['recent_sweep_bearish'] = df_feat['sweep_bearish'].rolling(window=max_velas_sweep, min_periods=1).max()
-        
-        # Limpieza de columnas temporales de cálculo
-        columnas_a_borrar = ['hour_utc', 'vol_sma_10', 'last_pl_high', 'last_pl_low']
-        df_feat.drop(columns=[col for col in columnas_a_borrar if col in df_feat.columns], inplace=True)
+        # ==========================================================
+        # 2. MICROESTRUCTURA DE LA VELA
+        #    Cálculos 100 % vectorizados con arrays NumPy
+        # ==========================================================
+        o = df_feat['open'].values
+        h = df_feat['high'].values
+        l = df_feat['low'].values
+        c = df_feat['close'].values
+
+        body_size = np.abs(c - o)
+        total_range = h - l
+        safe_range = np.where(total_range == 0, 1e-9, total_range)
+
+        max_oc = np.maximum(o, c)
+        min_oc = np.minimum(o, c)
+
+        df_feat['body_size'] = body_size
+        df_feat['total_range'] = total_range
+        df_feat['upper_wick'] = h - max_oc
+        df_feat['lower_wick'] = min_oc - l
+        df_feat['upper_wick_pct'] = (h - max_oc) / safe_range
+        df_feat['lower_wick_pct'] = (min_oc - l) / safe_range
+
+        # ==========================================================
+        # 3. VOLUMEN RELATIVO — Confirmación Institucional
+        #    shift(1) para evitar data leakage
+        # ==========================================================
+        period = SMCFeatureEngineer.VOL_SMA_PERIOD
+        vol_sma = df_feat['volume'].shift(1).rolling(window=period).mean()
+        df_feat['vol_relative'] = df_feat['volume'] / (vol_sma + 1e-9)
+
+        # ==========================================================
+        # 4. FAIR VALUE GAPS (FVG) — Ineficiencias de precio
+        # ==========================================================
+        df_feat['fvg_bullish'] = np.where(
+            df_feat['low'] > df_feat['high'].shift(2), 1, 0
+        )
+        df_feat['fvg_bearish'] = np.where(
+            df_feat['high'] < df_feat['low'].shift(2), 1, 0
+        )
+
+        # ==========================================================
+        # 5. PUNTOS LÍQUIDOS — Swing Highs / Lows
+        #    Lookback configurable (default 10 velas a cada lado).
+        #
+        #    Lógica anti-lookahead:
+        #      1. rolling(center=True) identifica el máximo/mínimo
+        #         real en una ventana de (2*LB + 1) velas.
+        #      2. shift(LB) retrasa la confirmación LB velas,
+        #         garantizando que el swing solo aparece cuando
+        #         ya existe toda la información a ambos lados.
+        #
+        #    Columnas de salida:
+        #      is_swing_high  = 1 en la vela donde se CONFIRMA
+        #      pl_high_price  = precio exacto del Swing High
+        #      is_swing_low   = 1 en la vela donde se CONFIRMA
+        #      pl_low_price   = precio exacto del Swing Low
+        #
+        #    smc.py consume estas columnas para registrar los PLs
+        #    en memoria espacial permanente.
+        # ==========================================================
+        lb = SMCFeatureEngineer.SWING_LOOKBACK
+        window = 2 * lb + 1
+
+        rolling_max = df_feat['high'].rolling(window=window, center=True).max()
+        rolling_min = df_feat['low'].rolling(window=window, center=True).min()
+
+        swing_high_raw = (df_feat['high'] == rolling_max).astype(int)
+        swing_low_raw = (df_feat['low'] == rolling_min).astype(int)
+
+        df_feat['is_swing_high'] = swing_high_raw.shift(lb).fillna(0).astype(int)
+        df_feat['is_swing_low'] = swing_low_raw.shift(lb).fillna(0).astype(int)
+
+        # Precio exacto del PL (la vela origen está LB posiciones atrás)
+        df_feat['pl_high_price'] = np.where(
+            df_feat['is_swing_high'] == 1, df_feat['high'].shift(lb), np.nan
+        )
+        df_feat['pl_low_price'] = np.where(
+            df_feat['is_swing_low'] == 1, df_feat['low'].shift(lb), np.nan
+        )
+
+        # ==========================================================
+        # LIMPIEZA FINAL
+        # ==========================================================
         df_feat.dropna(subset=['vol_relative'], inplace=True)
-        
-        print(f"✅ Ojos SMC listos. Velas procesadas: {len(df_feat)}")
+
+        n_sh = int(df_feat['is_swing_high'].sum())
+        n_sl = int(df_feat['is_swing_low'].sum())
+        print(
+            f"✅ Features v2.2 listas. "
+            f"Velas: {len(df_feat)} | "
+            f"Swing Highs: {n_sh} | Swing Lows: {n_sl}"
+        )
         return df_feat
 
+
+# ══════════════════════════════════════════════════════════════
+#  PRUEBA DE DIAGNÓSTICO
+# ══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # --- PRUEBA DE DIAGNÓSTICO ---
-    print("🛠️ Probando el Escáner SMC...")
-    # Simulamos datos en horario de Nueva York
-    fechas = pd.date_range('2024-01-01 13:00:00', periods=50, freq='5min', tz='UTC')
+    print("🛠️ Probando el Escáner SMC v2.2...")
+
+    fechas = pd.date_range(
+        '2024-01-02 13:00:00', periods=250, freq='5min', tz='UTC'
+    )
     np.random.seed(42)
-    
+
+    base = 2050.0
+    returns = np.random.normal(0, 0.5, 250)
+    prices = base + np.cumsum(returns)
+
     datos_prueba = pd.DataFrame({
-        'open': np.random.uniform(2000, 2010, 50),
-        'high': np.random.uniform(2010, 2020, 50),
-        'low': np.random.uniform(1990, 2000, 50),
-        'close': np.random.uniform(2000, 2010, 50),
-        'volume': np.random.randint(100, 1000, 50)
+        'open': prices,
+        'high': prices + np.random.uniform(0.3, 1.5, 250),
+        'low': prices - np.random.uniform(0.3, 1.5, 250),
+        'close': prices + np.random.normal(0, 0.3, 250),
+        'volume': np.random.randint(100, 2000, 250),
     }, index=fechas)
-    
+
     datos_con_features = SMCFeatureEngineer.calculate_features(datos_prueba)
-    
-    print("\n📊 MUESTRA DE VARIABLES SMC (Última vela):")
+
+    print("\n📊 COLUMNAS DISPONIBLES:")
+    print(datos_con_features.columns.tolist())
+
+    n_fvg_b = int(datos_con_features['fvg_bullish'].sum())
+    n_fvg_s = int(datos_con_features['fvg_bearish'].sum())
+    print(f"\n📊 FVGs -> Alcistas: {n_fvg_b} | Bajistas: {n_fvg_s}")
+
+    print("\n📊 MUESTRA (Última vela):")
     print(datos_con_features.tail(1).T)
