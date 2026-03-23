@@ -12,6 +12,7 @@ from src.features.features import SMCFeatureEngineer
 from src.brain import CerebroIA
 from src.telegram_bot.telegram_bot import TelegramNotifier
 from src.executor import TraderMT5
+from src.trade_logger import TradeLogger
 
 load_dotenv()
 
@@ -22,7 +23,8 @@ BUFFER_COSTOS_VANTAGE = 0.30
 RIESGO_POR_TRADE = 1.0
 
 # Alineado con smc.py y run_backtest.py
-SWEEP_COOLDOWN_VELAS = 8  # ~40 min en M5
+SWEEP_COOLDOWN_VELAS = 16  # ~80 min en M5
+FVG_MIN_SIZE = 3.0         # Ignorar FVGs menores a 3 pts (ruido)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -62,14 +64,16 @@ def generar_grafico_trade(df, fvg_data, decision, filename="temp_chart.png"):
     tiempo_entrada = data_plot['time'].iloc[-1]
     tiempo_futuro = tiempo_entrada + pd.Timedelta(minutes=5 * 15)
 
+    # SL detrás de la mecha de la vela señal (última cerrada)
+    vela_senal = data_plot.iloc[-1]
     if fvg_data['trade_direction'] == 'long':
-        sl = fvg_data['base_fvg'] - BUFFER_COSTOS_VANTAGE
+        sl = vela_senal['low'] - BUFFER_COSTOS_VANTAGE
         riesgo = precio_entrada - sl
         tp = precio_entrada + (riesgo * 2)
         color_riesgo = 'rgba(242, 54, 69, 0.2)'
         color_beneficio = 'rgba(8, 153, 129, 0.2)'
     else:
-        sl = fvg_data['techo_fvg'] + BUFFER_COSTOS_VANTAGE
+        sl = vela_senal['high'] + BUFFER_COSTOS_VANTAGE
         riesgo = sl - precio_entrada
         tp = precio_entrada - (riesgo * 2)
         color_riesgo = 'rgba(242, 54, 69, 0.2)'
@@ -119,10 +123,12 @@ def generar_grafico_trade(df, fvg_data, decision, filename="temp_chart.png"):
 # ═══════════════════════════════════════════════════════════════
 
 def ejecutar_analisis_forward(
-    ia, df, indice, fvg, direccion, etiqueta_tipo, trader, telegram
+    ia, df, indice, fvg, direccion, etiqueta_tipo,
+    trader, telegram, logger, cooldown_restante=0
 ):
     """
     Envía el setup a CerebroIA y, si aprueba, ejecuta en el broker.
+    Registra TODA decisión (aprobada o rechazada) en el logger.
 
     Retorna:
       - dict con _cuota_agotada=True → cuota diaria agotada
@@ -158,7 +164,10 @@ def ejecutar_analisis_forward(
     if decision.get('_cuota_agotada'):
         return decision
 
-    if decision.get('signal') == 1:
+    signal = decision.get('signal', 0)
+    reasoning = decision.get('reasoning', 'N/A')
+
+    if signal == 1:
         nombre_foto = "temp_chart.png"
 
         # 1. Generar gráfico y obtener niveles exactos
@@ -171,13 +180,36 @@ def ejecutar_analisis_forward(
             direccion, p_entrada, sl, tp
         )
 
-        # 3. Notificación por Telegram
+        # 3. Extraer ticket si se ejecutó
+        ticket = None
+        if exito and "Ticket:" in str(detalle):
+            ticket = str(detalle).split("Ticket:")[1].split("|")[0].strip()
+
+        # 4. Registrar trade APROBADO en log
+        logger.registrar(
+            timestamp_vela=df.index[indice],
+            direccion=direccion,
+            signal=1,
+            reasoning=reasoning,
+            fvg_top=fvg['top'],
+            fvg_bottom=fvg['bottom'],
+            precio_entrada=p_entrada,
+            sl=sl,
+            tp=tp,
+            ejecutado=exito,
+            ticket=ticket,
+            cooldown_restante=cooldown_restante,
+        )
+
+        # 5. Notificación por Telegram
         emoji = "🟢" if direccion == "long" else "🔴"
         msg = (
             f"{emoji} <b>NUEVA ENTRADA APROBADA "
             f"({direccion.upper()})</b>\n\n"
             f"📝 <b>Razonamiento:</b> "
-            f"<i>{decision.get('reasoning')}</i>\n\n"
+            f"<i>{reasoning}</i>\n\n"
+            f"🎯 <b>Entrada:</b> {round(p_entrada, 2)} | "
+            f"<b>SL:</b> {round(sl, 2)} | <b>TP:</b> {round(tp, 2)}\n\n"
             f"🤖 <b>Estado de Ejecución:</b> "
             f"{'✅ APROBADO' if exito else '❌ FALLÓ'}\n"
             f"<i>{detalle}</i>"
@@ -190,9 +222,20 @@ def ejecutar_analisis_forward(
         print(f"✅ Gráfico {direccion.upper()} y Orden enviados.")
         return True
 
+    # ── Trade RECHAZADO: también se registra ────────────────
+    logger.registrar(
+        timestamp_vela=df.index[indice],
+        direccion=direccion,
+        signal=0,
+        reasoning=reasoning,
+        fvg_top=fvg['top'],
+        fvg_bottom=fvg['bottom'],
+        cooldown_restante=cooldown_restante,
+    )
+
     print(
         f"🛑 IA rechazó el {direccion.upper()}. "
-        f"Motivo: {decision.get('reasoning', 'N/A')}"
+        f"Motivo: {reasoning}"
     )
     return False
 
@@ -228,6 +271,8 @@ def run_forward_tester():
     trader = TraderMT5(
         simbolo=SIMBOLO_ORO, riesgo_porcentaje=RIESGO_POR_TRADE
     )
+    logger = TradeLogger()
+    print(f"📝 Trade Logger activo → {logger.log_file}")
 
     telegram.enviar_mensaje(
         "🟢 <b>MODO COMBATE ACTIVADO</b>\n"
@@ -240,11 +285,12 @@ def run_forward_tester():
     # ═══════════════════════════════════════════════════════════
     active_bullish_fvgs = []      # {'top', 'bottom', 'creacion'}
     active_bearish_fvgs = []      # {'top', 'bottom', 'creacion'}
-    active_swing_highs = []       # {'price', 'timestamp'}
-    active_swing_lows = []        # {'price', 'timestamp'}
+    active_swing_highs = []       # PLs mayores {'price', 'timestamp'}
+    active_swing_lows = []        # PLs mayores {'price', 'timestamp'}
+    active_swing_highs_minor = [] # PLs menores {'price', 'timestamp'}
+    active_swing_lows_minor = []  # PLs menores {'price', 'timestamp'}
 
-    sweep_bull_cooldown = 0
-    sweep_bear_cooldown = 0
+    sweep_cooldown = 0  # Unificado: cualquier PL eliminado activa el contexto
 
     ultima_vela_procesada = None  # Marca de agua temporal
     cuota_agotada = False
@@ -292,6 +338,12 @@ def run_forward_tester():
         pl_high_prices = df['pl_high_price'].values
         pl_low_prices = df['pl_low_price'].values
 
+        # PLs Menores (lookback corto)
+        is_sh_minor = df['is_swing_high_minor'].values
+        is_sl_minor = df['is_swing_low_minor'].values
+        pl_high_prices_minor = df['pl_high_price_minor'].values
+        pl_low_prices_minor = df['pl_low_price_minor'].values
+
         # ── 4. Determinar rango de velas nuevas ──────────────
         # iloc[-1] es la vela EN FORMACIÓN → nunca se procesa.
         # Procesamos hasta iloc[-2] inclusive (última cerrada).
@@ -329,20 +381,24 @@ def run_forward_tester():
             # A. REGISTRO DE ZONAS FVG
             # ──────────────────────────────────────────────────
             if fvgs_bull[i] == 1:
-                active_bullish_fvgs.append({
-                    'top': lows[i],
-                    'bottom': highs[i - 2],
-                    'creacion': df.index[i],
-                })
+                size = lows[i] - highs[i - 2]
+                if size >= FVG_MIN_SIZE:
+                    active_bullish_fvgs.append({
+                        'top': lows[i],
+                        'bottom': highs[i - 2],
+                        'creacion': df.index[i],
+                    })
             if fvgs_bear[i] == 1:
-                active_bearish_fvgs.append({
-                    'top': lows[i - 2],
-                    'bottom': highs[i],
-                    'creacion': df.index[i],
-                })
+                size = lows[i - 2] - highs[i]
+                if size >= FVG_MIN_SIZE:
+                    active_bearish_fvgs.append({
+                        'top': lows[i - 2],
+                        'bottom': highs[i],
+                        'creacion': df.index[i],
+                    })
 
             # ──────────────────────────────────────────────────
-            # B. REGISTRO DE PUNTOS LÍQUIDOS (Memoria Espacial)
+            # B. REGISTRO DE PUNTOS LÍQUIDOS (Mayores + Menores)
             # ──────────────────────────────────────────────────
             if is_sh[i] == 1 and not np.isnan(pl_high_prices[i]):
                 active_swing_highs.append({
@@ -354,21 +410,40 @@ def run_forward_tester():
                     'price': pl_low_prices[i],
                     'timestamp': df.index[i],
                 })
+            if is_sh_minor[i] == 1 and not np.isnan(pl_high_prices_minor[i]):
+                active_swing_highs_minor.append({
+                    'price': pl_high_prices_minor[i],
+                    'timestamp': df.index[i],
+                })
+            if is_sl_minor[i] == 1 and not np.isnan(pl_low_prices_minor[i]):
+                active_swing_lows_minor.append({
+                    'price': pl_low_prices_minor[i],
+                    'timestamp': df.index[i],
+                })
 
             # ──────────────────────────────────────────────────
-            # C. DETECCIÓN DE SWEEPS EN TIEMPO REAL
+            # C. ELIMINACIÓN DE PLs (cualquier breach activa
+            #    el contexto — sin filtro de cierre)
             # ──────────────────────────────────────────────────
             for pl in active_swing_lows[:]:
                 if lows[i] < pl['price']:
-                    if closes[i] > pl['price']:
-                        sweep_bull_cooldown = SWEEP_COOLDOWN_VELAS
+                    sweep_cooldown = SWEEP_COOLDOWN_VELAS
                     active_swing_lows.remove(pl)
+
+            for pl in active_swing_lows_minor[:]:
+                if lows[i] < pl['price']:
+                    sweep_cooldown = SWEEP_COOLDOWN_VELAS
+                    active_swing_lows_minor.remove(pl)
 
             for pl in active_swing_highs[:]:
                 if highs[i] > pl['price']:
-                    if closes[i] < pl['price']:
-                        sweep_bear_cooldown = SWEEP_COOLDOWN_VELAS
+                    sweep_cooldown = SWEEP_COOLDOWN_VELAS
                     active_swing_highs.remove(pl)
+
+            for pl in active_swing_highs_minor[:]:
+                if highs[i] > pl['price']:
+                    sweep_cooldown = SWEEP_COOLDOWN_VELAS
+                    active_swing_highs_minor.remove(pl)
 
             # ──────────────────────────────────────────────────
             # D. GARBAGE COLLECTOR DE FVGs
@@ -385,16 +460,19 @@ def run_forward_tester():
 
             # ──────────────────────────────────────────────────
             # E. GATILLO — Solo en la ÚLTIMA vela cerrada
-            #    (Triple confluencia: Sweep activo + FVG
-            #     mitigado + Aprobación de IA)
+            #    (Confluencia: PL eliminado + FVG mitigado
+            #     + Confirmación de IA)
+            #    La dirección la define el tipo de FVG:
+            #      FVG Bullish mitigado → Long
+            #      FVG Bearish mitigado → Short
             # ──────────────────────────────────────────────────
             es_ultima_vela_cerrada = (i == indice_fin - 1)
 
-            if es_ultima_vela_cerrada and not cuota_agotada:
+            if es_ultima_vela_cerrada and sweep_cooldown > 0 and not cuota_agotada:
                 trade_analizado = False
 
-                # --- COMPRAS (Long) ---
-                if sweep_bull_cooldown > 0 and not trade_analizado:
+                # --- COMPRAS (Long): precio mitiga FVG Bullish ---
+                if not trade_analizado:
                     for fvg in active_bullish_fvgs[:]:
                         if lows[i] <= fvg['top']:
                             print(f"\n{'=' * 50}")
@@ -406,6 +484,7 @@ def run_forward_tester():
                             resultado = ejecutar_analisis_forward(
                                 ia, df, i, fvg, "long",
                                 "Alcista (Long)", trader, telegram,
+                                logger, sweep_cooldown,
                             )
                             trade_analizado = True
 
@@ -418,12 +497,8 @@ def run_forward_tester():
                             active_bullish_fvgs.remove(fvg)
                             break
 
-                # --- VENTAS (Short) ---
-                if (
-                    sweep_bear_cooldown > 0
-                    and not trade_analizado
-                    and not cuota_agotada
-                ):
+                # --- VENTAS (Short): precio mitiga FVG Bearish ---
+                if not trade_analizado and not cuota_agotada:
                     for fvg in active_bearish_fvgs[:]:
                         if highs[i] >= fvg['bottom']:
                             print(f"\n{'=' * 50}")
@@ -435,6 +510,7 @@ def run_forward_tester():
                             resultado = ejecutar_analisis_forward(
                                 ia, df, i, fvg, "short",
                                 "Bajista (Short)", trader, telegram,
+                                logger, sweep_cooldown,
                             )
                             trade_analizado = True
 
@@ -450,21 +526,22 @@ def run_forward_tester():
             # ──────────────────────────────────────────────────
             # F. DECREMENTO DE COOLDOWNS (una vez por cada vela)
             # ──────────────────────────────────────────────────
-            sweep_bull_cooldown = max(0, sweep_bull_cooldown - 1)
-            sweep_bear_cooldown = max(0, sweep_bear_cooldown - 1)
+            sweep_cooldown = max(0, sweep_cooldown - 1)
 
         # ── Actualizar marca de agua temporal ─────────────────
         if indice_fin > 0:
             ultima_vela_procesada = df.index[indice_fin - 1]
 
         # ── Diagnóstico de estado ─────────────────────────────
+        total_sh = len(active_swing_highs) + len(active_swing_highs_minor)
+        total_sl = len(active_swing_lows) + len(active_swing_lows_minor)
         print(
             f"   📊 Memoria Espacial: "
             f"{len(active_bullish_fvgs)} FVG↑ | "
             f"{len(active_bearish_fvgs)} FVG↓ | "
-            f"{len(active_swing_highs)} SH | "
-            f"{len(active_swing_lows)} SL | "
-            f"Cooldown ↑{sweep_bull_cooldown} ↓{sweep_bear_cooldown}"
+            f"{total_sh} SH ({len(active_swing_highs)}M+{len(active_swing_highs_minor)}m) | "
+            f"{total_sl} SL ({len(active_swing_lows)}M+{len(active_swing_lows_minor)}m) | "
+            f"CD={sweep_cooldown}"
         )
 
         print(

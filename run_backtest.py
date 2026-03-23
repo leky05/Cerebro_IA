@@ -17,7 +17,8 @@ except ImportError:
 load_dotenv()
 
 # ── Parámetro de Cooldown post-Sweep (alineado con smc.py) ───
-SWEEP_COOLDOWN_VELAS = 8  # ~40 min en M5
+SWEEP_COOLDOWN_VELAS = 16  # ~80 min en M5
+FVG_MIN_SIZE = 3.0         # Ignorar FVGs menores a 3 pts (ruido)
 
 
 def extraer_datos_reales():
@@ -47,18 +48,18 @@ def extraer_datos_reales():
 
 
 def calcular_parametros_trade(direccion, precio_entrada, contexto_velas, buffer_costos=0.25):
-    """Calcula Stop Loss estructural y Take Profit 1:2 simulando costos de Vantage"""
+    """Calcula SL detrás de la mecha de la vela señal + TP 1:2"""
+    # La vela señal es la última del contexto (la que activó el trigger)
+    vela_senal = contexto_velas[-1]
     if direccion == "long":
-        minimo_sweep = min(vela['low'] for vela in contexto_velas)
-        stop_loss = minimo_sweep - buffer_costos
+        stop_loss = vela_senal['low'] - buffer_costos
         riesgo = precio_entrada - stop_loss
         take_profit = precio_entrada + (riesgo * 2)
     elif direccion == "short":
-        maximo_sweep = max(vela['high'] for vela in contexto_velas)
-        stop_loss = maximo_sweep + buffer_costos
+        stop_loss = vela_senal['high'] + buffer_costos
         riesgo = stop_loss - precio_entrada
         take_profit = precio_entrada - (riesgo * 2)
-        
+
     return round(stop_loss, 2), round(take_profit, 2), round(riesgo, 2)
 
 
@@ -84,12 +85,13 @@ def run_real_hybrid_backtest():
     # ── Memorias Espaciales Persistentes (alineadas con smc.py v2.1) ──
     active_bullish_fvgs = []     # {'top', 'bottom', 'creacion'}
     active_bearish_fvgs = []     # {'top', 'bottom', 'creacion'}
-    active_swing_highs = []      # {'price', 'idx'}
-    active_swing_lows = []       # {'price', 'idx'}
+    active_swing_highs = []      # PLs mayores {'price', 'idx'}
+    active_swing_lows = []       # PLs mayores {'price', 'idx'}
+    active_swing_highs_minor = [] # PLs menores {'price', 'idx'}
+    active_swing_lows_minor = []  # PLs menores {'price', 'idx'}
 
-    # Cooldowns post-sweep
-    sweep_bull_cooldown = 0
-    sweep_bear_cooldown = 0
+    # Cooldown unificado: cualquier PL eliminado activa el contexto
+    sweep_cooldown = 0
 
     trades_activos = []
     historial_trades = []
@@ -108,6 +110,12 @@ def run_real_hybrid_backtest():
     is_sl_arr = df['is_swing_low'].values
     pl_high_prices = df['pl_high_price'].values
     pl_low_prices = df['pl_low_price'].values
+
+    # PLs Menores (lookback corto)
+    is_sh_minor = df['is_swing_high_minor'].values
+    is_sl_minor = df['is_swing_low_minor'].values
+    pl_high_prices_minor = df['pl_high_price_minor'].values
+    pl_low_prices_minor = df['pl_low_price_minor'].values
 
     # Contadores de diagnóstico
     sweeps_bull_total = 0
@@ -180,50 +188,73 @@ def run_real_hybrid_backtest():
         # 2. REGISTRO DE ZONAS FVG (Ocurre 24/5)
         # ═══════════════════════════════════════════════════════════
         if fvgs_bull[i] == 1:
-            active_bullish_fvgs.append({
-                'top': lows[i],
-                'bottom': highs[i - 2],
-                'creacion': fecha_actual,
-            })
-            
+            size = lows[i] - highs[i - 2]
+            if size >= FVG_MIN_SIZE:
+                active_bullish_fvgs.append({
+                    'top': lows[i],
+                    'bottom': highs[i - 2],
+                    'creacion': fecha_actual,
+                })
+
         if fvgs_bear[i] == 1:
-            active_bearish_fvgs.append({
-                'top': lows[i - 2],
-                'bottom': highs[i],
-                'creacion': fecha_actual,
-            })
+            size = lows[i - 2] - highs[i]
+            if size >= FVG_MIN_SIZE:
+                active_bearish_fvgs.append({
+                    'top': lows[i - 2],
+                    'bottom': highs[i],
+                    'creacion': fecha_actual,
+                })
 
         # ═══════════════════════════════════════════════════════════
-        # 3. REGISTRO DE PUNTOS LÍQUIDOS (Memoria Espacial)
+        # 3. REGISTRO DE PUNTOS LÍQUIDOS (Mayores + Menores)
         # ═══════════════════════════════════════════════════════════
         if is_sh[i] == 1 and not np.isnan(pl_high_prices[i]):
             active_swing_highs.append({
                 'price': pl_high_prices[i],
                 'idx': i,
             })
-
         if is_sl_arr[i] == 1 and not np.isnan(pl_low_prices[i]):
             active_swing_lows.append({
                 'price': pl_low_prices[i],
                 'idx': i,
             })
+        if is_sh_minor[i] == 1 and not np.isnan(pl_high_prices_minor[i]):
+            active_swing_highs_minor.append({
+                'price': pl_high_prices_minor[i],
+                'idx': i,
+            })
+        if is_sl_minor[i] == 1 and not np.isnan(pl_low_prices_minor[i]):
+            active_swing_lows_minor.append({
+                'price': pl_low_prices_minor[i],
+                'idx': i,
+            })
 
         # ═══════════════════════════════════════════════════════════
-        # 4. DETECCIÓN DE SWEEPS EN TIEMPO REAL
+        # 4. ELIMINACIÓN DE PLs (cualquier breach activa contexto)
         # ═══════════════════════════════════════════════════════════
         for pl in active_swing_lows[:]:
             if lows[i] < pl['price']:
-                if closes[i] > pl['price']:
-                    sweep_bull_cooldown = SWEEP_COOLDOWN_VELAS
-                    sweeps_bull_total += 1
+                sweep_cooldown = SWEEP_COOLDOWN_VELAS
+                sweeps_bull_total += 1
                 active_swing_lows.remove(pl)
+
+        for pl in active_swing_lows_minor[:]:
+            if lows[i] < pl['price']:
+                sweep_cooldown = SWEEP_COOLDOWN_VELAS
+                sweeps_bull_total += 1
+                active_swing_lows_minor.remove(pl)
 
         for pl in active_swing_highs[:]:
             if highs[i] > pl['price']:
-                if closes[i] < pl['price']:
-                    sweep_bear_cooldown = SWEEP_COOLDOWN_VELAS
-                    sweeps_bear_total += 1
+                sweep_cooldown = SWEEP_COOLDOWN_VELAS
+                sweeps_bear_total += 1
                 active_swing_highs.remove(pl)
+
+        for pl in active_swing_highs_minor[:]:
+            if highs[i] > pl['price']:
+                sweep_cooldown = SWEEP_COOLDOWN_VELAS
+                sweeps_bear_total += 1
+                active_swing_highs_minor.remove(pl)
 
         # ═══════════════════════════════════════════════════════════
         # 5. GARBAGE COLLECTOR DE FVGs
@@ -242,58 +273,56 @@ def run_real_hybrid_backtest():
         # 6. GATILLO — Triple Confluencia + Llamada a IA
         # ═══════════════════════════════════════════════════════════
         if not (df.index[i].hour >= 13 and df.index[i].hour < 16):
-            sweep_bull_cooldown = max(0, sweep_bull_cooldown - 1)
-            sweep_bear_cooldown = max(0, sweep_bear_cooldown - 1)
+            sweep_cooldown = max(0, sweep_cooldown - 1)
             continue
 
         if analisis_realizados >= limite_analisis:
-            sweep_bull_cooldown = max(0, sweep_bull_cooldown - 1)
-            sweep_bear_cooldown = max(0, sweep_bear_cooldown - 1)
+            sweep_cooldown = max(0, sweep_cooldown - 1)
             continue
 
-        trade_tomado_esta_vela = False 
+        trade_tomado_esta_vela = False
 
-        # --- COMPRAS (Long) ---
-        if sweep_bull_cooldown > 0 and not trade_tomado_esta_vela:
-            for fvg in active_bullish_fvgs[:]: 
-                if lows[i] <= fvg['top']:
-                    decision = ejecutar_analisis_ia(ia, df, i, fvg, "long", "Alcista")
-                    analisis_realizados += 1
-                    trade_tomado_esta_vela = True
+        # ── GATILLO: PL eliminado + FVG mitigado + IA confirma ──
+        if sweep_cooldown > 0:
 
-                    # Check de cuota diaria agotada
-                    if decision.get('_cuota_agotada'):
-                        cuota_agotada = True
+            # --- COMPRAS (Long): precio mitiga FVG Bullish ---
+            if not trade_tomado_esta_vela:
+                for fvg in active_bullish_fvgs[:]:
+                    if lows[i] <= fvg['top']:
+                        decision = ejecutar_analisis_ia(ia, df, i, fvg, "long", "Alcista")
+                        analisis_realizados += 1
+                        trade_tomado_esta_vela = True
+
+                        if decision.get('_cuota_agotada'):
+                            cuota_agotada = True
+                            active_bullish_fvgs.remove(fvg)
+                            break
+
+                        if decision:
+                            trades_activos.append(decision)
                         active_bullish_fvgs.remove(fvg)
                         break
 
-                    if decision:
-                        trades_activos.append(decision)
-                    active_bullish_fvgs.remove(fvg)
-                    break
+            # --- VENTAS (Short): precio mitiga FVG Bearish ---
+            if not trade_tomado_esta_vela and not cuota_agotada:
+                for fvg in active_bearish_fvgs[:]:
+                    if highs[i] >= fvg['bottom']:
+                        decision = ejecutar_analisis_ia(ia, df, i, fvg, "short", "Bajista")
+                        analisis_realizados += 1
+                        trade_tomado_esta_vela = True
 
-        # --- VENTAS (Short) ---
-        if sweep_bear_cooldown > 0 and not trade_tomado_esta_vela and not cuota_agotada:
-            for fvg in active_bearish_fvgs[:]:
-                if highs[i] >= fvg['bottom']:
-                    decision = ejecutar_analisis_ia(ia, df, i, fvg, "short", "Bajista")
-                    analisis_realizados += 1
-                    trade_tomado_esta_vela = True
+                        if decision.get('_cuota_agotada'):
+                            cuota_agotada = True
+                            active_bearish_fvgs.remove(fvg)
+                            break
 
-                    # Check de cuota diaria agotada
-                    if decision.get('_cuota_agotada'):
-                        cuota_agotada = True
+                        if decision:
+                            trades_activos.append(decision)
                         active_bearish_fvgs.remove(fvg)
                         break
 
-                    if decision:
-                        trades_activos.append(decision)
-                    active_bearish_fvgs.remove(fvg)
-                    break
-
-        # Decremento de cooldowns
-        sweep_bull_cooldown = max(0, sweep_bull_cooldown - 1)
-        sweep_bear_cooldown = max(0, sweep_bear_cooldown - 1)
+        # Decremento de cooldown
+        sweep_cooldown = max(0, sweep_cooldown - 1)
 
     # ═══════════════════════════════════════════════════════════
     # RESUMEN FINAL
@@ -303,7 +332,11 @@ def run_real_hybrid_backtest():
         print("⚠️  Backtest interrumpido por cuota diaria de Gemini Free Tier (20 req/día).")
     print(f"Análisis IA realizados: {analisis_realizados}")
     print(f"Sweeps detectados -> Alcistas: {sweeps_bull_total} | Bajistas: {sweeps_bear_total}")
-    print(f"PLs vivos al cierre: {len(active_swing_highs) + len(active_swing_lows)}")
+    total_pls = (
+        len(active_swing_highs) + len(active_swing_lows)
+        + len(active_swing_highs_minor) + len(active_swing_lows_minor)
+    )
+    print(f"PLs vivos al cierre: {total_pls} (Mayores: {len(active_swing_highs)+len(active_swing_lows)} | Menores: {len(active_swing_highs_minor)+len(active_swing_lows_minor)})")
     print(f"FVGs vivos al cierre: {len(active_bullish_fvgs) + len(active_bearish_fvgs)}")
     print(f"Operaciones totales: {len(historial_trades)}")
     tps = sum(1 for t in historial_trades if t['resultado'] == 'TP')

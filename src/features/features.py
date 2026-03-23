@@ -24,7 +24,8 @@ class SMCFeatureEngineer:
     """
 
     # ── Parámetros Configurables ──────────────────────────────────
-    SWING_LOOKBACK = 10        # Velas a cada lado para confirmar un swing
+    SWING_LOOKBACK = 10        # Velas a cada lado para PLs mayores (estructurales)
+    SWING_LOOKBACK_MINOR = 5   # Velas a cada lado para PLs menores (corto plazo)
     VOL_SMA_PERIOD = 10        # Período de la SMA de volumen
 
     # ──────────────────────────────────────────────────────────────
@@ -131,16 +132,59 @@ class SMCFeatureEngineer:
         )
 
         # ==========================================================
+        # 5b. PUNTOS LÍQUIDOS MENORES — Lookback corto
+        #     Misma lógica que los mayores pero con ventana más
+        #     chica para capturar PLs de corto plazo que el mercado
+        #     barre con frecuencia (ej: swing lows recientes).
+        #
+        #     Deduplicación: si un PL menor coincide exactamente
+        #     con un PL mayor (mismo precio en la misma vela),
+        #     se anula el menor para evitar duplicación en memoria.
+        # ==========================================================
+        lb_m = SMCFeatureEngineer.SWING_LOOKBACK_MINOR
+        window_m = 2 * lb_m + 1
+
+        rolling_max_m = df_feat['high'].rolling(window=window_m, center=True).max()
+        rolling_min_m = df_feat['low'].rolling(window=window_m, center=True).min()
+
+        swing_high_raw_m = (df_feat['high'] == rolling_max_m).astype(int)
+        swing_low_raw_m = (df_feat['low'] == rolling_min_m).astype(int)
+
+        is_sh_minor = swing_high_raw_m.shift(lb_m).fillna(0).astype(int)
+        is_sl_minor = swing_low_raw_m.shift(lb_m).fillna(0).astype(int)
+
+        # Deduplicar: anular menores que ya fueron detectados como mayores
+        is_sh_minor = is_sh_minor & ~(df_feat['is_swing_high'] == 1)
+        is_sl_minor = is_sl_minor & ~(df_feat['is_swing_low'] == 1)
+
+        df_feat['is_swing_high_minor'] = is_sh_minor.astype(int)
+        df_feat['is_swing_low_minor'] = is_sl_minor.astype(int)
+
+        df_feat['pl_high_price_minor'] = np.where(
+            df_feat['is_swing_high_minor'] == 1,
+            df_feat['high'].shift(lb_m),
+            np.nan,
+        )
+        df_feat['pl_low_price_minor'] = np.where(
+            df_feat['is_swing_low_minor'] == 1,
+            df_feat['low'].shift(lb_m),
+            np.nan,
+        )
+
+        # ==========================================================
         # LIMPIEZA FINAL
         # ==========================================================
         df_feat.dropna(subset=['vol_relative'], inplace=True)
 
         n_sh = int(df_feat['is_swing_high'].sum())
         n_sl = int(df_feat['is_swing_low'].sum())
+        n_sh_m = int(df_feat['is_swing_high_minor'].sum())
+        n_sl_m = int(df_feat['is_swing_low_minor'].sum())
         print(
-            f"✅ Features v2.2 listas. "
+            f"✅ Features v2.3 listas. "
             f"Velas: {len(df_feat)} | "
-            f"Swing Highs: {n_sh} | Swing Lows: {n_sl}"
+            f"PLs Mayores: {n_sh} SH / {n_sl} SL | "
+            f"PLs Menores: {n_sh_m} SH / {n_sl_m} SL"
         )
         return df_feat
 
